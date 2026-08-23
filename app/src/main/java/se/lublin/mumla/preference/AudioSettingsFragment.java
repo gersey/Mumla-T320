@@ -4,12 +4,14 @@ import static java.util.Objects.requireNonNull;
 import static se.lublin.mumla.Settings.DEFAULT_ECHO_CANCELLATION_METHOD;
 import static se.lublin.mumla.Settings.PREF_ECHO_CANCELLATION_METHOD;
 
+import android.content.Intent;
 import android.media.AudioFormat;
 import android.media.AudioRecord;
 import android.media.audiofx.AcousticEchoCanceler;
 import android.os.Bundle;
 
 import androidx.preference.ListPreference;
+import androidx.preference.Preference;
 import androidx.preference.PreferenceCategory;
 import androidx.preference.PreferenceScreen;
 
@@ -19,8 +21,12 @@ import java.util.List;
 
 import se.lublin.mumla.R;
 import se.lublin.mumla.Settings;
+import se.lublin.mumla.service.T320PttAccessibilityService;
 
 public class AudioSettingsFragment extends MumlaPreferenceFragment {
+    private static final String T320_PTT_ACCESSIBILITY_SETTINGS =
+            "t320_ptt_accessibility_settings";
+
     @Override
     public void onCreatePreferences(Bundle savedInstanceState, String rootKey) {
         setPreferencesFromResource(R.xml.settings_audio, rootKey);
@@ -54,7 +60,24 @@ public class AudioSettingsFragment extends MumlaPreferenceFragment {
             }
         }
 
+        Preference t320PttDiagnostics = findPreference(T320_PTT_ACCESSIBILITY_SETTINGS);
+        requireNonNull(t320PttDiagnostics).setOnPreferenceClickListener(preference -> {
+            startActivity(new Intent(android.provider.Settings.ACTION_ACCESSIBILITY_SETTINGS));
+            return true;
+        });
+
         updateAudioDependents(getPreferenceScreen(), inputPreference.getValue());
+    }
+
+    @Override
+    public void onResume() {
+        super.onResume();
+        Preference preference = findPreference(T320_PTT_ACCESSIBILITY_SETTINGS);
+        if (preference != null) {
+            preference.setSummary(T320PttAccessibilityService.isEnabled(requireContext())
+                    ? R.string.t320_ptt_diagnostics_enabled
+                    : R.string.t320_ptt_diagnostics_disabled);
+        }
     }
 
     private void removeListEntry(ListPreference pref, String valueToRemove) {

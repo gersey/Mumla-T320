@@ -21,8 +21,8 @@ import android.content.BroadcastReceiver;
 import android.content.Context;
 import android.content.Intent;
 
-import se.lublin.humla.IHumlaService;
 import se.lublin.humla.IHumlaSession;
+import se.lublin.mumla.service.IMumlaService;
 
 /**
  * Created by andrew on 08/08/14.
@@ -33,10 +33,12 @@ public class TalkBroadcastReceiver extends BroadcastReceiver {
     public static final String TALK_STATUS_ON = "on";
     public static final String TALK_STATUS_OFF = "off";
     public static final String TALK_STATUS_TOGGLE = "toggle";
+    public static final String TALK_STATUS_T320_PTT_DOWN = "t320_ptt_down";
+    public static final String TALK_STATUS_T320_PTT_UP = "t320_ptt_up";
 
-    private IHumlaService mService;
+    private final IMumlaService mService;
 
-    public TalkBroadcastReceiver(IHumlaService service) {
+    public TalkBroadcastReceiver(IMumlaService service) {
         mService = service;
     }
 
@@ -45,15 +47,21 @@ public class TalkBroadcastReceiver extends BroadcastReceiver {
         if (BROADCAST_TALK.equals(intent.getAction())) {
             if (!mService.isConnected())
                 return;
-            IHumlaSession session = mService.HumlaSession();
             String status = intent.getStringExtra(EXTRA_TALK_STATUS);
             if (status == null) status = TALK_STATUS_TOGGLE;
-            if (TALK_STATUS_ON.equals(status)) {
-                session.setTalkingState(true);
-            } else if (TALK_STATUS_OFF.equals(status)) {
-                session.setTalkingState(false);
-            } else if (TALK_STATUS_TOGGLE.equals(status)) {
-                session.setTalkingState(!session.isTalking());
+            if (TALK_STATUS_T320_PTT_DOWN.equals(status)) {
+                mService.onT320PttDown();
+            } else if (TALK_STATUS_T320_PTT_UP.equals(status)) {
+                mService.onT320PttUp();
+            } else {
+                IHumlaSession session = mService.HumlaSession();
+                if (TALK_STATUS_ON.equals(status)) {
+                    session.setTalkingState(true);
+                } else if (TALK_STATUS_OFF.equals(status)) {
+                    session.setTalkingState(false);
+                } else if (TALK_STATUS_TOGGLE.equals(status)) {
+                    session.setTalkingState(!session.isTalking());
+                }
             }
         } else {
             throw new UnsupportedOperationException();

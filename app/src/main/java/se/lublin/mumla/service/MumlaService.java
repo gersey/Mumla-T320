@@ -22,10 +22,13 @@ import android.content.Intent;
 import android.content.IntentFilter;
 import android.content.SharedPreferences;
 import android.media.AudioManager;
+import android.media.MediaPlayer;
+import android.media.ToneGenerator;
 import android.net.Uri;
 import android.os.Binder;
 import android.os.Build;
 import android.os.Bundle;
+import android.os.Handler;
 import android.os.IBinder;
 import android.os.PowerManager;
 import android.speech.tts.TextToSpeech;
@@ -45,6 +48,7 @@ import java.util.List;
 import se.lublin.humla.Constants;
 import se.lublin.humla.HumlaService;
 import se.lublin.humla.exception.AudioException;
+import se.lublin.humla.model.IChannel;
 import se.lublin.humla.model.IMessage;
 import se.lublin.humla.model.IUser;
 import se.lublin.humla.model.Message;
@@ -70,6 +74,10 @@ public class MumlaService extends HumlaService implements
     public static final int PROXIMITY_SCREEN_OFF_WAKE_LOCK = 32;
     public static final int TTS_THRESHOLD = 250; // Maximum number of characters to read
     public static final int RECONNECT_DELAY = 10000;
+    private static final long T320_END_CUE_TX_SETTLE_DELAY_MS = 100L;
+    private static final int T320_BUSY_BEEP_COUNT = 3;
+    private static final int T320_BUSY_BEEP_DURATION_MS = 120;
+    private static final long T320_BUSY_BEEP_INTERVAL_MS = 220L;
 
     private Settings mSettings;
     private MumlaConnectionNotification mNotification;
@@ -81,6 +89,39 @@ public class MumlaService extends HumlaService implements
     private PowerManager.WakeLock mProximityLock;
     /** Play sound when push to talk key is pressed */
     private boolean mPTTSoundEnabled;
+    /** Suppresses Mumla's legacy key-click while the T320 uses its dedicated local cue. */
+    private boolean mT320PttActive;
+    private boolean mT320PttPressed;
+    private boolean mT320StartPending;
+    private boolean mT320TxActive;
+    private boolean mT320BusyBlocked;
+    private Handler mT320Handler;
+    private MediaPlayer mT320CuePlayer;
+    private ToneGenerator mT320BusyTone;
+    private int mT320BusyBeepsPlayed;
+    private final Runnable mPlayT320EndCue = () -> {
+        if (!mT320PttPressed && !mT320BusyBlocked) {
+            playT320Cue(R.raw.t320_end_of_my_tx, "END_TX", null);
+        }
+    };
+    private final Runnable mPlayNextT320BusyBeep = new Runnable() {
+        @Override
+        public void run() {
+            if (mT320BusyTone == null) {
+                return;
+            }
+            if (mT320BusyBeepsPlayed >= T320_BUSY_BEEP_COUNT) {
+                stopT320BusySignal("COMPLETED");
+                return;
+            }
+            mT320BusyTone.startTone(ToneGenerator.TONE_PROP_BEEP, T320_BUSY_BEEP_DURATION_MS);
+            mT320BusyBeepsPlayed++;
+            Log.e(T320PttAccessibilityService.LOG_TAG, "busyCue=BEEP index="
+                    + mT320BusyBeepsPlayed + " of=" + T320_BUSY_BEEP_COUNT
+                    + " localOnly=true tx=OFF");
+            mT320Handler.postDelayed(this, T320_BUSY_BEEP_INTERVAL_MS);
+        }
+    };
     /** Try to shorten spoken messages when using TTS */
     private boolean mShortTtsMessagesEnabled;
     /**
@@ -281,7 +322,8 @@ public class MumlaService extends HumlaService implements
                     user.getSession() == selfSession &&
                     getTransmitMode() == Constants.TRANSMIT_PUSH_TO_TALK &&
                     user.getTalkState() == TalkState.TALKING &&
-                    mPTTSoundEnabled) {
+                    mPTTSoundEnabled &&
+                    !mT320PttActive) {
                 AudioManager audioManager = (AudioManager) getSystemService(AUDIO_SERVICE);
                 audioManager.playSoundEffect(AudioManager.FX_KEYPRESS_STANDARD, -1);
             }
@@ -291,6 +333,7 @@ public class MumlaService extends HumlaService implements
     @Override
     public void onCreate() {
         super.onCreate();
+        mT320Handler = new Handler(getMainLooper());
         registerObserver(mObserver);
 
         // Register for preference changes
@@ -325,6 +368,7 @@ public class MumlaService extends HumlaService implements
 
     @Override
     public void onDestroy() {
+        resetT320PttState("SERVICE_DESTROYED");
         if (mNotification != null) {
             mNotification.hide();
             mNotification = null;
@@ -390,6 +434,7 @@ public class MumlaService extends HumlaService implements
 
     @Override
     public void onConnectionDisconnected(HumlaException e) {
+        resetT320PttState("CONNECTION_DISCONNECTED");
         super.onConnectionDisconnected(e);
         try {
             unregisterReceiver(mTalkReceiver);
@@ -631,6 +676,246 @@ public class MumlaService extends HumlaService implements
                 setTalkingState(false); // Stop talking
             }
         }
+    }
+
+    /** Handles T320 DOWN, including local pre-TX and channel-busy cues. */
+    @Override
+    public void onT320PttDown() {
+        if (mT320PttPressed) {
+            Log.e(T320PttAccessibilityService.LOG_TAG, "pttState=DOWN_IGNORED reason=DUPLICATE");
+            return;
+        }
+
+        mT320Handler.removeCallbacks(mPlayT320EndCue);
+        stopT320Cue("NEW_PTT_DOWN");
+        stopT320BusySignal("NEW_PTT_DOWN");
+        mT320PttPressed = true;
+        mT320BusyBlocked = false;
+
+        if (!isT320PttEligible()) {
+            Log.e(T320PttAccessibilityService.LOG_TAG,
+                    "pttState=DOWN_IGNORED reason=NOT_CONNECTED_OR_NOT_PTT");
+            return;
+        }
+
+        int busyTalkers = countAudibleRemoteTalkers();
+        if (busyTalkers > 0) {
+            mT320BusyBlocked = true;
+            playT320BusySignal();
+            Log.e(T320PttAccessibilityService.LOG_TAG, "channel=BUSY remoteTalkers="
+                    + busyTalkers + " tx=OFF");
+            return;
+        }
+
+        mT320StartPending = true;
+        playT320Cue(R.raw.t320_before_my_tx, "BEFORE_TX", this::startT320TxAfterCue);
+    }
+
+    /** Stops T320 transmission before the local end cue is allowed to play. */
+    @Override
+    public void onT320PttUp() {
+        boolean hadPress = mT320PttPressed;
+        boolean wasBusyBlocked = mT320BusyBlocked;
+        boolean shouldPlayEndCue = hadPress && !wasBusyBlocked
+                && (mT320StartPending || mT320TxActive);
+
+        mT320PttPressed = false;
+        mT320StartPending = false;
+        mT320BusyBlocked = false;
+        stopT320Cue("PTT_UP");
+
+        if (mT320TxActive && isT320PttEligible() && isTalking()) {
+            setTalkingState(false);
+        }
+        mT320TxActive = false;
+        mT320PttActive = false;
+
+        if (shouldPlayEndCue) {
+            mT320Handler.postDelayed(mPlayT320EndCue, T320_END_CUE_TX_SETTLE_DELAY_MS);
+        }
+        Log.e(T320PttAccessibilityService.LOG_TAG, "txCommand=UP handled=" + hadPress
+                + " busyBlocked=" + wasBusyBlocked + " talking="
+                + (isT320PttEligible() && isTalking()));
+    }
+
+    private void startT320TxAfterCue() {
+        mT320StartPending = false;
+        if (!mT320PttPressed || !isT320PttEligible()) {
+            Log.e(T320PttAccessibilityService.LOG_TAG,
+                    "txCommand=DOWN_CANCELLED reason=RELEASED_OR_NOT_READY");
+            return;
+        }
+
+        int busyTalkers = countAudibleRemoteTalkers();
+        if (busyTalkers > 0) {
+            mT320BusyBlocked = true;
+            playT320BusySignal();
+            Log.e(T320PttAccessibilityService.LOG_TAG, "channel=BECAME_BUSY remoteTalkers="
+                    + busyTalkers + " tx=OFF");
+            return;
+        }
+
+        if (!isTalking()) {
+            mT320PttActive = true;
+            mT320TxActive = true;
+            setTalkingState(true);
+        }
+        Log.e(T320PttAccessibilityService.LOG_TAG, "txCommand=DOWN handled=true talking="
+                + isTalking());
+    }
+
+    private boolean isT320PttEligible() {
+        return isConnectionEstablished()
+                && Settings.ARRAY_INPUT_METHOD_PTT.equals(mSettings.getInputMethod());
+    }
+
+    private int countAudibleRemoteTalkers() {
+        try {
+            IUser self = getSessionUser();
+            IChannel root = getRootChannel();
+            if (self == null || root == null) {
+                return 0;
+            }
+            return countTalkingUsers(root, self.getSession());
+        } catch (IllegalStateException error) {
+            Log.e(T320PttAccessibilityService.LOG_TAG,
+                    "channel=BUSY_CHECK_FAILED tx=OFF", error);
+            return 0;
+        }
+    }
+
+    private int countTalkingUsers(IChannel channel, int selfSession) {
+        int count = 0;
+        for (IUser user : channel.getUsers()) {
+            if (user != null && user.getSession() != selfSession
+                    && user.getTalkState() != TalkState.PASSIVE) {
+                count++;
+            }
+        }
+        for (IChannel child : channel.getSubchannels()) {
+            if (child != null) {
+                count += countTalkingUsers(child, selfSession);
+            }
+        }
+        return count;
+    }
+
+    private void playT320Cue(int resourceId, final String cueName, final Runnable onFinished) {
+        stopT320Cue("REPLACED_BY_" + cueName);
+        final MediaPlayer player = MediaPlayer.create(this, resourceId);
+        if (player == null) {
+            Log.e(T320PttAccessibilityService.LOG_TAG,
+                    "cue=" + cueName + " state=CREATE_FAILED localOnly=true");
+            if (onFinished != null) {
+                onFinished.run();
+            }
+            return;
+        }
+
+        mT320CuePlayer = player;
+        player.setOnCompletionListener(completedPlayer -> {
+            boolean current = mT320CuePlayer == completedPlayer;
+            if (current) {
+                mT320CuePlayer = null;
+            }
+            completedPlayer.release();
+            Log.e(T320PttAccessibilityService.LOG_TAG, "cue=" + cueName
+                    + " state=COMPLETED localOnly=true");
+            if (current && onFinished != null) {
+                onFinished.run();
+            }
+        });
+        player.setOnErrorListener((failedPlayer, what, extra) -> {
+            boolean current = mT320CuePlayer == failedPlayer;
+            if (current) {
+                mT320CuePlayer = null;
+            }
+            failedPlayer.release();
+            Log.e(T320PttAccessibilityService.LOG_TAG, "cue=" + cueName
+                    + " state=ERROR what=" + what + " extra=" + extra + " localOnly=true");
+            if (current && onFinished != null) {
+                onFinished.run();
+            }
+            return true;
+        });
+
+        try {
+            player.start();
+            Log.e(T320PttAccessibilityService.LOG_TAG,
+                    "cue=" + cueName + " state=STARTED localOnly=true");
+        } catch (IllegalStateException error) {
+            if (mT320CuePlayer == player) {
+                mT320CuePlayer = null;
+            }
+            player.release();
+            Log.e(T320PttAccessibilityService.LOG_TAG,
+                    "cue=" + cueName + " state=START_FAILED localOnly=true", error);
+            if (onFinished != null) {
+                onFinished.run();
+            }
+        }
+    }
+
+    private void stopT320Cue(String reason) {
+        MediaPlayer player = mT320CuePlayer;
+        mT320CuePlayer = null;
+        if (player == null) {
+            return;
+        }
+        player.setOnCompletionListener(null);
+        player.setOnErrorListener(null);
+        try {
+            player.stop();
+        } catch (IllegalStateException ignored) {
+        }
+        player.release();
+        Log.e(T320PttAccessibilityService.LOG_TAG,
+                "cue=ACTIVE state=STOPPED reason=" + reason + " localOnly=true");
+    }
+
+    private void playT320BusySignal() {
+        stopT320Cue("CHANNEL_BUSY");
+        stopT320BusySignal("RESTARTED");
+        try {
+            mT320BusyTone = new ToneGenerator(AudioManager.STREAM_MUSIC, 100);
+            mT320BusyBeepsPlayed = 0;
+            mT320Handler.post(mPlayNextT320BusyBeep);
+        } catch (RuntimeException error) {
+            mT320BusyTone = null;
+            Log.e(T320PttAccessibilityService.LOG_TAG,
+                    "busyCue=CREATE_FAILED localOnly=true tx=OFF", error);
+        }
+    }
+
+    private void stopT320BusySignal(String reason) {
+        if (mT320Handler != null) {
+            mT320Handler.removeCallbacks(mPlayNextT320BusyBeep);
+        }
+        ToneGenerator tone = mT320BusyTone;
+        mT320BusyTone = null;
+        if (tone != null) {
+            tone.stopTone();
+            tone.release();
+            Log.e(T320PttAccessibilityService.LOG_TAG,
+                    "busyCue=STOPPED reason=" + reason + " localOnly=true tx=OFF");
+        }
+        mT320BusyBeepsPlayed = 0;
+    }
+
+    private void resetT320PttState(String reason) {
+        if (mT320Handler != null) {
+            mT320Handler.removeCallbacks(mPlayT320EndCue);
+        }
+        stopT320Cue(reason);
+        stopT320BusySignal(reason);
+        if (mT320TxActive && isConnectionEstablished() && isTalking()) {
+            setTalkingState(false);
+        }
+        mT320PttPressed = false;
+        mT320StartPending = false;
+        mT320TxActive = false;
+        mT320BusyBlocked = false;
+        mT320PttActive = false;
     }
 
     @Override
