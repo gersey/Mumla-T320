@@ -7,6 +7,10 @@ The start cue is played while TX is off, and TX starts only after the `BEFORE_TX
 On release, TX is stopped first; the `END_TX` cue starts after a 100 ms capture-settle delay. This
 ordering keeps both sounds out of the Mumble microphone stream.
 
+If another audible remote Mumble user is already talking when PTT is pressed, TX remains off.
+Mumla plays three short local beeps instead of the start/end cues. Busy state is checked again
+when the start cue completes, preventing a race with a remote speaker who starts during the cue.
+
 ## Enable the listener
 
 1. Open Mumla.
@@ -34,6 +38,9 @@ event=PTT_UP keyCode=229 scanCode=88 action=ACTION_UP repeatCount=0 ... consumed
 txCommand=UP handled=true talking=false
 cue=END_TX state=STARTED localOnly=true tx=OFF
 ```
+
+For a busy channel, the expected sequence contains `channel=BUSY`, exactly three
+`busyCue=BEEP` entries, and no `txCommand=DOWN handled=true` entry.
 
 ## Test matrix
 
