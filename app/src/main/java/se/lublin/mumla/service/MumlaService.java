@@ -31,6 +31,7 @@ import android.os.Bundle;
 import android.os.Handler;
 import android.os.IBinder;
 import android.os.PowerManager;
+import android.os.SystemClock;
 import android.speech.tts.TextToSpeech;
 import android.util.Log;
 import android.widget.Toast;
@@ -79,6 +80,9 @@ public class MumlaService extends HumlaService implements
     private static final int T320_BUSY_BEEP_COUNT = 3;
     private static final int T320_BUSY_BEEP_DURATION_MS = 120;
     private static final long T320_BUSY_BEEP_INTERVAL_MS = 220L;
+    private static final String T320_FLOOR_PROTOCOL = "[T320-FLOOR/1]";
+    private static final String T320_FLOOR_GATEWAY_NAME = "HA1GSY-Gateway";
+    private static final long T320_FLOOR_REQUEST_TIMEOUT_MS = 1800L;
 
     private Settings mSettings;
     private MumlaConnectionNotification mNotification;
@@ -96,11 +100,25 @@ public class MumlaService extends HumlaService implements
     private boolean mT320StartPending;
     private boolean mT320TxActive;
     private boolean mT320BusyBlocked;
+    private boolean mT320FloorRequestPending;
+    private String mT320FloorToken;
+    private int mT320FloorGatewaySession = -1;
     private Handler mT320Handler;
     private MediaPlayer mT320CuePlayer;
     private ToneGenerator mT320BusyTone;
     private int mT320BusyBeepsPlayed;
     private final Runnable mStartT320TxAfterCue = this::startT320TxAfterCue;
+    private final Runnable mT320FloorRequestTimeout = () -> {
+        if (!mT320FloorRequestPending) {
+            return;
+        }
+        mT320FloorRequestPending = false;
+        mT320BusyBlocked = true;
+        Log.e(T320PttAccessibilityService.LOG_TAG,
+                "floor=TIMEOUT tx=OFF token=" + mT320FloorToken);
+        releaseT320Floor();
+        playT320BusySignal();
+    };
     private final Runnable mPlayT320EndCue = () -> {
         if (!mT320PttPressed && !mT320BusyBlocked) {
             playT320Cue(R.raw.t320_end_of_my_tx, "END_TX", null);
@@ -247,6 +265,9 @@ public class MumlaService extends HumlaService implements
 
         @Override
         public void onMessageLogged(IMessage message) {
+            if (handleT320FloorMessage(message)) {
+                return;
+            }
             // Split on / strip all HTML tags.
             Document parsedMessage = Jsoup.parseBodyFragment(message.getMessage());
             String strippedMessage = parsedMessage.text();
@@ -710,8 +731,7 @@ public class MumlaService extends HumlaService implements
             return;
         }
 
-        mT320StartPending = true;
-        playT320Cue(R.raw.t320_before_my_tx, "BEFORE_TX", this::scheduleT320TxAfterCue);
+        requestT320Floor();
     }
 
     /** Stops T320 transmission before the local end cue is allowed to play. */
@@ -722,6 +742,7 @@ public class MumlaService extends HumlaService implements
         boolean shouldPlayEndCue = hadPress && !wasBusyBlocked
                 && (mT320StartPending || mT320TxActive);
 
+        releaseT320Floor();
         mT320PttPressed = false;
         mT320StartPending = false;
         mT320BusyBlocked = false;
@@ -753,6 +774,7 @@ public class MumlaService extends HumlaService implements
         int busyTalkers = countAudibleRemoteTalkers();
         if (busyTalkers > 0) {
             mT320BusyBlocked = true;
+            releaseT320Floor();
             playT320BusySignal();
             Log.e(T320PttAccessibilityService.LOG_TAG, "channel=BECAME_BUSY remoteTalkers="
                     + busyTalkers + " tx=OFF");
@@ -766,6 +788,151 @@ public class MumlaService extends HumlaService implements
         }
         Log.e(T320PttAccessibilityService.LOG_TAG, "txCommand=DOWN handled=true talking="
                 + isTalking());
+    }
+
+    private void requestT320Floor() {
+        IUser gateway = findT320FloorGateway(getRootChannel());
+        if (gateway == null) {
+            mT320BusyBlocked = true;
+            playT320BusySignal();
+            Log.e(T320PttAccessibilityService.LOG_TAG,
+                    "floor=DENIED reason=GATEWAY_NOT_FOUND tx=OFF");
+            return;
+        }
+
+        mT320FloorToken = Long.toHexString(SystemClock.elapsedRealtime())
+                + "-" + Integer.toHexString(getSessionId());
+        mT320FloorGatewaySession = gateway.getSession();
+        mT320FloorRequestPending = true;
+        mT320Handler.removeCallbacks(mT320FloorRequestTimeout);
+        mT320Handler.postDelayed(mT320FloorRequestTimeout, T320_FLOOR_REQUEST_TIMEOUT_MS);
+        try {
+            super.sendUserTextMessage(
+                    mT320FloorGatewaySession,
+                    T320_FLOOR_PROTOCOL + " CLAIM " + mT320FloorToken);
+            Log.e(T320PttAccessibilityService.LOG_TAG,
+                    "floor=CLAIM_SENT gatewaySession=" + mT320FloorGatewaySession
+                            + " token=" + mT320FloorToken);
+        } catch (RuntimeException error) {
+            mT320Handler.removeCallbacks(mT320FloorRequestTimeout);
+            mT320FloorRequestPending = false;
+            mT320BusyBlocked = true;
+            playT320BusySignal();
+            Log.e(T320PttAccessibilityService.LOG_TAG,
+                    "floor=CLAIM_FAILED tx=OFF", error);
+        }
+    }
+
+    private boolean handleT320FloorMessage(IMessage message) {
+        if (message == null || !T320_FLOOR_GATEWAY_NAME.equals(message.getActorName())) {
+            return false;
+        }
+        String text = Jsoup.parseBodyFragment(message.getMessage()).text();
+        if (!text.startsWith(T320_FLOOR_PROTOCOL + " ")) {
+            return false;
+        }
+
+        String[] parts = text.split("\\s+", 4);
+        if (parts.length < 3 || mT320FloorToken == null
+                || !mT320FloorToken.equals(parts[2])) {
+            return true;
+        }
+
+        String command = parts[1];
+        if ("GRANT".equals(command)) {
+            mT320Handler.removeCallbacks(mT320FloorRequestTimeout);
+            mT320FloorRequestPending = false;
+            if (!mT320PttPressed || !isT320PttEligible()) {
+                releaseT320Floor();
+                return true;
+            }
+            int busyTalkers = countAudibleRemoteTalkers();
+            if (busyTalkers > 0) {
+                mT320BusyBlocked = true;
+                releaseT320Floor();
+                playT320BusySignal();
+                Log.e(T320PttAccessibilityService.LOG_TAG,
+                        "floor=GRANTED_BUT_LOCAL_BUSY remoteTalkers=" + busyTalkers
+                                + " tx=OFF");
+                return true;
+            }
+            mT320StartPending = true;
+            playT320Cue(
+                    R.raw.t320_before_my_tx,
+                    "BEFORE_TX",
+                    this::scheduleT320TxAfterCue);
+            Log.e(T320PttAccessibilityService.LOG_TAG,
+                    "floor=GRANTED token=" + mT320FloorToken);
+        } else if ("BUSY".equals(command)) {
+            mT320Handler.removeCallbacks(mT320FloorRequestTimeout);
+            mT320FloorRequestPending = false;
+            mT320FloorToken = null;
+            mT320FloorGatewaySession = -1;
+            mT320BusyBlocked = true;
+            playT320BusySignal();
+            String owner = parts.length >= 4 ? parts[3] : "ISMERETLEN";
+            Log.e(T320PttAccessibilityService.LOG_TAG,
+                    "floor=BUSY owner=" + owner + " tx=OFF");
+        } else if ("REVOKE".equals(command)) {
+            mT320Handler.removeCallbacks(mT320FloorRequestTimeout);
+            mT320Handler.removeCallbacks(mStartT320TxAfterCue);
+            mT320FloorRequestPending = false;
+            mT320StartPending = false;
+            mT320FloorToken = null;
+            mT320FloorGatewaySession = -1;
+            stopT320Cue("FLOOR_REVOKED");
+            if (mT320TxActive && isT320PttEligible() && isTalking()) {
+                setTalkingState(false);
+            }
+            mT320TxActive = false;
+            mT320PttActive = false;
+            mT320BusyBlocked = true;
+            playT320BusySignal();
+            Log.e(T320PttAccessibilityService.LOG_TAG,
+                    "floor=REVOKED reason=" + (parts.length >= 4 ? parts[3] : "UNKNOWN")
+                            + " tx=OFF");
+        }
+        return true;
+    }
+
+    private void releaseT320Floor() {
+        mT320Handler.removeCallbacks(mT320FloorRequestTimeout);
+        String token = mT320FloorToken;
+        int gatewaySession = mT320FloorGatewaySession;
+        mT320FloorRequestPending = false;
+        mT320FloorToken = null;
+        mT320FloorGatewaySession = -1;
+        if (token == null || gatewaySession < 0 || !isConnectionEstablished()) {
+            return;
+        }
+        try {
+            super.sendUserTextMessage(
+                    gatewaySession,
+                    T320_FLOOR_PROTOCOL + " RELEASE " + token);
+            Log.e(T320PttAccessibilityService.LOG_TAG,
+                    "floor=RELEASE_SENT token=" + token);
+        } catch (RuntimeException error) {
+            Log.e(T320PttAccessibilityService.LOG_TAG,
+                    "floor=RELEASE_FAILED token=" + token, error);
+        }
+    }
+
+    private IUser findT320FloorGateway(IChannel channel) {
+        if (channel == null) {
+            return null;
+        }
+        for (IUser user : channel.getUsers()) {
+            if (user != null && T320_FLOOR_GATEWAY_NAME.equals(user.getName())) {
+                return user;
+            }
+        }
+        for (IChannel child : channel.getSubchannels()) {
+            IUser found = findT320FloorGateway(child);
+            if (found != null) {
+                return found;
+            }
+        }
+        return null;
     }
 
     private void scheduleT320TxAfterCue() {
@@ -924,6 +1091,7 @@ public class MumlaService extends HumlaService implements
         if (mT320Handler != null) {
             mT320Handler.removeCallbacks(mPlayT320EndCue);
             mT320Handler.removeCallbacks(mStartT320TxAfterCue);
+            mT320Handler.removeCallbacks(mT320FloorRequestTimeout);
         }
         stopT320Cue(reason);
         stopT320BusySignal(reason);
@@ -934,6 +1102,9 @@ public class MumlaService extends HumlaService implements
         mT320StartPending = false;
         mT320TxActive = false;
         mT320BusyBlocked = false;
+        mT320FloorRequestPending = false;
+        mT320FloorToken = null;
+        mT320FloorGatewaySession = -1;
         mT320PttActive = false;
     }
 
