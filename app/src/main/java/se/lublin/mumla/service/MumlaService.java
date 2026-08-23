@@ -74,6 +74,7 @@ public class MumlaService extends HumlaService implements
     public static final int PROXIMITY_SCREEN_OFF_WAKE_LOCK = 32;
     public static final int TTS_THRESHOLD = 250; // Maximum number of characters to read
     public static final int RECONNECT_DELAY = 10000;
+    private static final long T320_START_CUE_TX_SETTLE_DELAY_MS = 200L;
     private static final long T320_END_CUE_TX_SETTLE_DELAY_MS = 100L;
     private static final int T320_BUSY_BEEP_COUNT = 3;
     private static final int T320_BUSY_BEEP_DURATION_MS = 120;
@@ -99,6 +100,7 @@ public class MumlaService extends HumlaService implements
     private MediaPlayer mT320CuePlayer;
     private ToneGenerator mT320BusyTone;
     private int mT320BusyBeepsPlayed;
+    private final Runnable mStartT320TxAfterCue = this::startT320TxAfterCue;
     private final Runnable mPlayT320EndCue = () -> {
         if (!mT320PttPressed && !mT320BusyBlocked) {
             playT320Cue(R.raw.t320_end_of_my_tx, "END_TX", null);
@@ -687,6 +689,7 @@ public class MumlaService extends HumlaService implements
         }
 
         mT320Handler.removeCallbacks(mPlayT320EndCue);
+        mT320Handler.removeCallbacks(mStartT320TxAfterCue);
         stopT320Cue("NEW_PTT_DOWN");
         stopT320BusySignal("NEW_PTT_DOWN");
         mT320PttPressed = true;
@@ -708,7 +711,7 @@ public class MumlaService extends HumlaService implements
         }
 
         mT320StartPending = true;
-        playT320Cue(R.raw.t320_before_my_tx, "BEFORE_TX", this::startT320TxAfterCue);
+        playT320Cue(R.raw.t320_before_my_tx, "BEFORE_TX", this::scheduleT320TxAfterCue);
     }
 
     /** Stops T320 transmission before the local end cue is allowed to play. */
@@ -722,6 +725,7 @@ public class MumlaService extends HumlaService implements
         mT320PttPressed = false;
         mT320StartPending = false;
         mT320BusyBlocked = false;
+        mT320Handler.removeCallbacks(mStartT320TxAfterCue);
         stopT320Cue("PTT_UP");
 
         if (mT320TxActive && isT320PttEligible() && isTalking()) {
@@ -762,6 +766,20 @@ public class MumlaService extends HumlaService implements
         }
         Log.e(T320PttAccessibilityService.LOG_TAG, "txCommand=DOWN handled=true talking="
                 + isTalking());
+    }
+
+    private void scheduleT320TxAfterCue() {
+        if (!mT320PttPressed || !mT320StartPending) {
+            return;
+        }
+        mT320Handler.removeCallbacks(mStartT320TxAfterCue);
+        mT320Handler.postDelayed(
+                mStartT320TxAfterCue,
+                T320_START_CUE_TX_SETTLE_DELAY_MS);
+        Log.e(T320PttAccessibilityService.LOG_TAG,
+                "cue=BEFORE_TX state=SETTLING delayMs="
+                        + T320_START_CUE_TX_SETTLE_DELAY_MS
+                        + " localOnly=true tx=OFF");
     }
 
     private boolean isT320PttEligible() {
@@ -905,6 +923,7 @@ public class MumlaService extends HumlaService implements
     private void resetT320PttState(String reason) {
         if (mT320Handler != null) {
             mT320Handler.removeCallbacks(mPlayT320EndCue);
+            mT320Handler.removeCallbacks(mStartT320TxAfterCue);
         }
         stopT320Cue(reason);
         stopT320BusySignal(reason);
