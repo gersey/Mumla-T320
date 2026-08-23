@@ -101,6 +101,15 @@
             android:summary="@string/halfDuplexSum"
             app:iconSpaceReserved="false"/>
     </PreferenceCategory>
+    <PreferenceCategory
+        android:title="@string/t320_ptt_diagnostics_category"
+        app:iconSpaceReserved="false">
+        <Preference
+            android:key="t320_ptt_accessibility_settings"
+            android:summary="@string/t320_ptt_diagnostics_disabled"
+            android:title="@string/t320_ptt_diagnostics_title"
+            app:iconSpaceReserved="false" />
+    </PreferenceCategory>
     <PreferenceCategory android:title="@string/advancedAudio"
         app:iconSpaceReserved="false">
 
