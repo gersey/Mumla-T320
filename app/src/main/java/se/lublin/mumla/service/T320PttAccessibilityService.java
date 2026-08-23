@@ -4,6 +4,7 @@ import android.accessibilityservice.AccessibilityService;
 import android.app.KeyguardManager;
 import android.content.ComponentName;
 import android.content.Context;
+import android.media.MediaPlayer;
 import android.os.PowerManager;
 import android.provider.Settings;
 import android.text.TextUtils;
@@ -12,12 +13,15 @@ import android.view.InputDevice;
 import android.view.KeyEvent;
 import android.view.accessibility.AccessibilityEvent;
 
+import se.lublin.mumla.R;
+
 /**
- * Diagnostic-only global key listener for the physical PTT button on the Inrico T320.
+ * Global key listener for the physical PTT button on the Inrico T320.
  *
- * <p>This service intentionally does not call Mumla's transmit code and does not consume the
- * key event. It only records the first DOWN and the matching UP in logcat so behaviour can be
- * verified while Mumla is in the background and while the device is locked.</p>
+ * <p>This phase records the first DOWN and matching UP and plays local PTT cue sounds. It still
+ * deliberately does not call Mumla's transmit code and does not consume the key event. The start
+ * cue finishes before the future TX gate becomes ready; the end cue starts only after that gate
+ * has been closed. This prevents either cue from entering the future Mumble microphone stream.</p>
  */
 public class T320PttAccessibilityService extends AccessibilityService {
     public static final String LOG_TAG = "MumlaT320PTT";
@@ -26,13 +30,14 @@ public class T320PttAccessibilityService extends AccessibilityService {
     private static final int T320_PTT_SCAN_CODE = 88;
 
     private boolean pttPressed;
+    private MediaPlayer cuePlayer;
 
     @Override
     protected void onServiceConnected() {
         super.onServiceConnected();
         pttPressed = false;
         // T320 user firmware sets the global app log threshold to ERROR (log.tag=E).
-        Log.e(LOG_TAG, "service=CONNECTED mode=LOG_ONLY consumed=false");
+        Log.e(LOG_TAG, "service=CONNECTED mode=LOCAL_CUES_ONLY tx=OFF consumed=false");
     }
 
     @Override
@@ -46,10 +51,16 @@ public class T320PttAccessibilityService extends AccessibilityService {
             boolean duplicateDown = pttPressed;
             pttPressed = true;
             logPttEvent("PTT_DOWN", event, "duplicateDown=" + duplicateDown);
+            if (!duplicateDown) {
+                playLocalCue(R.raw.t320_before_my_tx, "BEFORE_TX");
+            }
         } else if (event.getAction() == KeyEvent.ACTION_UP) {
             boolean hadDown = pttPressed;
             pttPressed = false;
             logPttEvent("PTT_UP", event, "hadDown=" + hadDown);
+            if (hadDown) {
+                playLocalCue(R.raw.t320_end_of_my_tx, "END_TX");
+            }
         }
 
         // Diagnostic phase: observe the event without stealing it from the system or another app.
@@ -80,6 +91,68 @@ public class T320PttAccessibilityService extends AccessibilityService {
                 + " consumed=false");
     }
 
+    private void playLocalCue(int resourceId, final String cueName) {
+        stopLocalCue("REPLACED_BY_" + cueName);
+
+        final MediaPlayer player = MediaPlayer.create(this, resourceId);
+        if (player == null) {
+            Log.e(LOG_TAG, "cue=" + cueName + " state=CREATE_FAILED localOnly=true tx=OFF");
+            return;
+        }
+
+        cuePlayer = player;
+        player.setOnCompletionListener(completedPlayer -> {
+            if (cuePlayer == completedPlayer) {
+                cuePlayer = null;
+            }
+            completedPlayer.release();
+            Log.e(LOG_TAG, "cue=" + cueName + " state=COMPLETED localOnly=true tx=OFF"
+                    + " pttPressed=" + pttPressed);
+            if ("BEFORE_TX".equals(cueName) && pttPressed) {
+                // Future TX integration belongs here, after the local start cue is inaudible.
+                Log.e(LOG_TAG, "txGate=READY_AFTER_BEFORE_CUE tx=OFF pttPressed=true");
+            }
+        });
+        player.setOnErrorListener((failedPlayer, what, extra) -> {
+            if (cuePlayer == failedPlayer) {
+                cuePlayer = null;
+            }
+            failedPlayer.release();
+            Log.e(LOG_TAG, "cue=" + cueName + " state=ERROR what=" + what
+                    + " extra=" + extra + " localOnly=true tx=OFF");
+            return true;
+        });
+
+        try {
+            player.start();
+            Log.e(LOG_TAG, "cue=" + cueName + " state=STARTED localOnly=true tx=OFF");
+        } catch (IllegalStateException error) {
+            if (cuePlayer == player) {
+                cuePlayer = null;
+            }
+            player.release();
+            Log.e(LOG_TAG, "cue=" + cueName + " state=START_FAILED localOnly=true tx=OFF", error);
+        }
+    }
+
+    private void stopLocalCue(String reason) {
+        MediaPlayer player = cuePlayer;
+        cuePlayer = null;
+        if (player == null) {
+            return;
+        }
+
+        player.setOnCompletionListener(null);
+        player.setOnErrorListener(null);
+        try {
+            player.stop();
+        } catch (IllegalStateException ignored) {
+            // Releasing below is sufficient if playback had not reached the started state.
+        }
+        player.release();
+        Log.e(LOG_TAG, "cue=ACTIVE state=STOPPED reason=" + reason + " localOnly=true tx=OFF");
+    }
+
     private static String actionToString(int action) {
         if (action == KeyEvent.ACTION_DOWN) {
             return "ACTION_DOWN";
@@ -98,12 +171,14 @@ public class T320PttAccessibilityService extends AccessibilityService {
     @Override
     public void onInterrupt() {
         pttPressed = false;
+        stopLocalCue("SERVICE_INTERRUPTED");
         Log.e(LOG_TAG, "service=INTERRUPTED");
     }
 
     @Override
     public void onDestroy() {
         pttPressed = false;
+        stopLocalCue("SERVICE_DESTROYED");
         Log.e(LOG_TAG, "service=DESTROYED");
         super.onDestroy();
     }

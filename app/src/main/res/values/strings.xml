@@ -204,13 +204,13 @@
     <string name="donation_thanks">Thank you for the donation.</string>
     <string name="image_confirm_send">Send this image?</string>
 
-    <!-- Inrico T320 global PTT diagnostics -->
+    <!-- Inrico T320 global PTT diagnostics and local cues -->
     <string name="t320_ptt_diagnostics_category">Inrico T320</string>
-    <string name="t320_ptt_diagnostics_title">Background PTT diagnostics</string>
-    <string name="t320_ptt_diagnostics_enabled">Enabled — PTT events are written to the MumlaT320PTT log</string>
+    <string name="t320_ptt_diagnostics_title">Background PTT test</string>
+    <string name="t320_ptt_diagnostics_enabled">Enabled — local start/end cues and PTT event logging are active</string>
     <string name="t320_ptt_diagnostics_disabled">Disabled — tap to enable the service in Accessibility settings</string>
-    <string name="t320_ptt_accessibility_service_label">Mumla T320 PTT diagnostics</string>
-    <string name="t320_ptt_accessibility_service_description">Logs the Inrico T320 physical PTT button (key code 229, scan code 88) in the foreground, background, and on the lock screen. It does not start Mumla transmission.</string>
+    <string name="t320_ptt_accessibility_service_label">Mumla T320 PTT test</string>
+    <string name="t320_ptt_accessibility_service_description">Logs the Inrico T320 physical PTT button (key code 229, scan code 88) and plays local start/end cues in the foreground, background, and on the lock screen. It does not start Mumla transmission.</string>
 
     <plurals name="search_channel_users">
         <item quantity="one">%d user</item>

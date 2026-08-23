@@ -1,7 +1,11 @@
 # Inrico T320 PTT diagnostic test
 
-This phase only logs the physical PTT button. It deliberately does not call Mumla's transmit
-code and it does not consume the key event.
+This phase logs the physical PTT button and plays the bundled local start/end cue sounds. It
+deliberately does not call Mumla's transmit code and it does not consume the key event.
+
+The start cue is played while TX is off. A future TX integration may only open the TX gate after
+the `BEFORE_TX` cue completes. On release, the TX gate must be closed before the `END_TX` cue is
+played. This ordering keeps both sounds out of the Mumble microphone stream.
 
 ## Enable the listener
 
@@ -17,13 +21,16 @@ adb logcat -s MumlaT320PTT:E '*:S'
 ```
 
 Every normal press must produce exactly one `PTT_DOWN` and one `PTT_UP`. Holding the button
-must not produce additional `PTT_DOWN` entries from repeated Android DOWN events.
+must not produce additional `PTT_DOWN` entries from repeated Android DOWN events. It must also
+produce one local `BEFORE_TX` cue and one local `END_TX` cue.
 
 Expected fields include:
 
 ```text
 event=PTT_DOWN keyCode=229 scanCode=88 action=ACTION_DOWN repeatCount=0 ... consumed=false
+cue=BEFORE_TX state=STARTED localOnly=true tx=OFF
 event=PTT_UP keyCode=229 scanCode=88 action=ACTION_UP repeatCount=0 ... consumed=false
+cue=END_TX state=STARTED localOnly=true tx=OFF
 ```
 
 ## Test matrix
