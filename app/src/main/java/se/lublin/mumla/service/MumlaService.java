@@ -81,6 +81,8 @@ public class MumlaService extends HumlaService implements
     private PowerManager.WakeLock mProximityLock;
     /** Play sound when push to talk key is pressed */
     private boolean mPTTSoundEnabled;
+    /** Suppresses Mumla's legacy key-click while the T320 uses its dedicated local cue. */
+    private boolean mT320PttActive;
     /** Try to shorten spoken messages when using TTS */
     private boolean mShortTtsMessagesEnabled;
     /**
@@ -281,7 +283,8 @@ public class MumlaService extends HumlaService implements
                     user.getSession() == selfSession &&
                     getTransmitMode() == Constants.TRANSMIT_PUSH_TO_TALK &&
                     user.getTalkState() == TalkState.TALKING &&
-                    mPTTSoundEnabled) {
+                    mPTTSoundEnabled &&
+                    !mT320PttActive) {
                 AudioManager audioManager = (AudioManager) getSystemService(AUDIO_SERVICE);
                 audioManager.playSoundEffect(AudioManager.FX_KEYPRESS_STANDARD, -1);
             }
@@ -390,6 +393,7 @@ public class MumlaService extends HumlaService implements
 
     @Override
     public void onConnectionDisconnected(HumlaException e) {
+        mT320PttActive = false;
         super.onConnectionDisconnected(e);
         try {
             unregisterReceiver(mTalkReceiver);
@@ -631,6 +635,32 @@ public class MumlaService extends HumlaService implements
                 setTalkingState(false); // Stop talking
             }
         }
+    }
+
+    /** Handles the T320 physical PTT as a momentary switch, regardless of toggle-PTT settings. */
+    @Override
+    public void onT320PttDown() {
+        boolean eligible = isConnectionEstablished()
+                && Settings.ARRAY_INPUT_METHOD_PTT.equals(mSettings.getInputMethod());
+        mT320PttActive = eligible;
+        if (eligible && !isTalking()) {
+            setTalkingState(true);
+        }
+        Log.e(T320PttAccessibilityService.LOG_TAG, "txCommand=DOWN handled=" + eligible
+                + " talking=" + (eligible && isTalking()));
+    }
+
+    /** Stops T320 transmission before the accessibility service plays the local end cue. */
+    @Override
+    public void onT320PttUp() {
+        boolean eligible = isConnectionEstablished()
+                && Settings.ARRAY_INPUT_METHOD_PTT.equals(mSettings.getInputMethod());
+        if (eligible && isTalking()) {
+            setTalkingState(false);
+        }
+        mT320PttActive = false;
+        Log.e(T320PttAccessibilityService.LOG_TAG, "txCommand=UP handled=" + eligible
+                + " talking=" + (eligible && isTalking()));
     }
 
     @Override

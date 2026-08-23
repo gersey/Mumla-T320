@@ -4,7 +4,10 @@ import android.accessibilityservice.AccessibilityService;
 import android.app.KeyguardManager;
 import android.content.ComponentName;
 import android.content.Context;
+import android.content.Intent;
 import android.media.MediaPlayer;
+import android.os.Handler;
+import android.os.Looper;
 import android.os.PowerManager;
 import android.provider.Settings;
 import android.text.TextUtils;
@@ -14,30 +17,39 @@ import android.view.KeyEvent;
 import android.view.accessibility.AccessibilityEvent;
 
 import se.lublin.mumla.R;
+import se.lublin.mumla.service.ipc.TalkBroadcastReceiver;
 
 /**
  * Global key listener for the physical PTT button on the Inrico T320.
  *
- * <p>This phase records the first DOWN and matching UP and plays local PTT cue sounds. It still
- * deliberately does not call Mumla's transmit code and does not consume the key event. The start
- * cue finishes before the future TX gate becomes ready; the end cue starts only after that gate
- * has been closed. This prevents either cue from entering the future Mumble microphone stream.</p>
+ * <p>The start cue finishes before Mumla receives PTT DOWN. On release Mumla receives PTT UP,
+ * then the end cue starts after a short capture-settle delay. This prevents either local cue from
+ * entering the Mumble microphone stream.</p>
  */
 public class T320PttAccessibilityService extends AccessibilityService {
     public static final String LOG_TAG = "MumlaT320PTT";
 
     private static final int T320_PTT_KEY_CODE = KeyEvent.KEYCODE_LAST_CHANNEL;
     private static final int T320_PTT_SCAN_CODE = 88;
+    private static final long END_CUE_TX_SETTLE_DELAY_MS = 100L;
 
+    private final Handler mainHandler = new Handler(Looper.getMainLooper());
     private boolean pttPressed;
+    private boolean txDownSent;
     private MediaPlayer cuePlayer;
+    private final Runnable playEndCue = () -> {
+        if (!pttPressed) {
+            playLocalCue(R.raw.t320_end_of_my_tx, "END_TX");
+        }
+    };
 
     @Override
     protected void onServiceConnected() {
         super.onServiceConnected();
         pttPressed = false;
+        txDownSent = false;
         // T320 user firmware sets the global app log threshold to ERROR (log.tag=E).
-        Log.e(LOG_TAG, "service=CONNECTED mode=LOCAL_CUES_ONLY tx=OFF consumed=false");
+        Log.e(LOG_TAG, "service=CONNECTED mode=MUMLA_PTT_WITH_LOCAL_CUES consumed=true");
     }
 
     @Override
@@ -50,8 +62,10 @@ public class T320PttAccessibilityService extends AccessibilityService {
         if (event.getAction() == KeyEvent.ACTION_DOWN && event.getRepeatCount() == 0) {
             boolean duplicateDown = pttPressed;
             pttPressed = true;
+            mainHandler.removeCallbacks(playEndCue);
             logPttEvent("PTT_DOWN", event, "duplicateDown=" + duplicateDown);
             if (!duplicateDown) {
+                txDownSent = false;
                 playLocalCue(R.raw.t320_before_my_tx, "BEFORE_TX");
             }
         } else if (event.getAction() == KeyEvent.ACTION_UP) {
@@ -59,12 +73,15 @@ public class T320PttAccessibilityService extends AccessibilityService {
             pttPressed = false;
             logPttEvent("PTT_UP", event, "hadDown=" + hadDown);
             if (hadDown) {
-                playLocalCue(R.raw.t320_end_of_my_tx, "END_TX");
+                sendT320PttCommand(TalkBroadcastReceiver.TALK_STATUS_T320_PTT_UP);
+                txDownSent = false;
+                stopLocalCue("PTT_UP");
+                mainHandler.postDelayed(playEndCue, END_CUE_TX_SETTLE_DELAY_MS);
             }
         }
 
-        // Diagnostic phase: observe the event without stealing it from the system or another app.
-        return false;
+        // Mumla owns the recognized T320 PTT key, including repeated DOWN events while held.
+        return true;
     }
 
     private void logPttEvent(String eventName, KeyEvent event, String pairingState) {
@@ -88,7 +105,7 @@ public class T320PttAccessibilityService extends AccessibilityService {
                 + " eventTime=" + event.getEventTime()
                 + " downTime=" + event.getDownTime()
                 + " " + pairingState
-                + " consumed=false");
+                + " consumed=true");
     }
 
     private void playLocalCue(int resourceId, final String cueName) {
@@ -109,8 +126,8 @@ public class T320PttAccessibilityService extends AccessibilityService {
             Log.e(LOG_TAG, "cue=" + cueName + " state=COMPLETED localOnly=true tx=OFF"
                     + " pttPressed=" + pttPressed);
             if ("BEFORE_TX".equals(cueName) && pttPressed) {
-                // Future TX integration belongs here, after the local start cue is inaudible.
-                Log.e(LOG_TAG, "txGate=READY_AFTER_BEFORE_CUE tx=OFF pttPressed=true");
+                txDownSent = true;
+                sendT320PttCommand(TalkBroadcastReceiver.TALK_STATUS_T320_PTT_DOWN);
             }
         });
         player.setOnErrorListener((failedPlayer, what, extra) -> {
@@ -120,6 +137,10 @@ public class T320PttAccessibilityService extends AccessibilityService {
             failedPlayer.release();
             Log.e(LOG_TAG, "cue=" + cueName + " state=ERROR what=" + what
                     + " extra=" + extra + " localOnly=true tx=OFF");
+            if ("BEFORE_TX".equals(cueName) && pttPressed) {
+                txDownSent = true;
+                sendT320PttCommand(TalkBroadcastReceiver.TALK_STATUS_T320_PTT_DOWN);
+            }
             return true;
         });
 
@@ -132,7 +153,19 @@ public class T320PttAccessibilityService extends AccessibilityService {
             }
             player.release();
             Log.e(LOG_TAG, "cue=" + cueName + " state=START_FAILED localOnly=true tx=OFF", error);
+            if ("BEFORE_TX".equals(cueName) && pttPressed) {
+                txDownSent = true;
+                sendT320PttCommand(TalkBroadcastReceiver.TALK_STATUS_T320_PTT_DOWN);
+            }
         }
+    }
+
+    private void sendT320PttCommand(String status) {
+        Intent intent = new Intent(TalkBroadcastReceiver.BROADCAST_TALK);
+        intent.setPackage(getPackageName());
+        intent.putExtra(TalkBroadcastReceiver.EXTRA_TALK_STATUS, status);
+        sendBroadcast(intent);
+        Log.e(LOG_TAG, "txCommand=" + status + " state=SENT txDownSent=" + txDownSent);
     }
 
     private void stopLocalCue(String reason) {
@@ -170,15 +203,23 @@ public class T320PttAccessibilityService extends AccessibilityService {
 
     @Override
     public void onInterrupt() {
-        pttPressed = false;
-        stopLocalCue("SERVICE_INTERRUPTED");
+        releaseT320Ptt("SERVICE_INTERRUPTED");
         Log.e(LOG_TAG, "service=INTERRUPTED");
+    }
+
+    private void releaseT320Ptt(String reason) {
+        mainHandler.removeCallbacks(playEndCue);
+        if (pttPressed || txDownSent) {
+            sendT320PttCommand(TalkBroadcastReceiver.TALK_STATUS_T320_PTT_UP);
+        }
+        pttPressed = false;
+        txDownSent = false;
+        stopLocalCue(reason);
     }
 
     @Override
     public void onDestroy() {
-        pttPressed = false;
-        stopLocalCue("SERVICE_DESTROYED");
+        releaseT320Ptt("SERVICE_DESTROYED");
         Log.e(LOG_TAG, "service=DESTROYED");
         super.onDestroy();
     }

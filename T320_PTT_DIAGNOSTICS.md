@@ -1,11 +1,11 @@
 # Inrico T320 PTT diagnostic test
 
-This phase logs the physical PTT button and plays the bundled local start/end cue sounds. It
-deliberately does not call Mumla's transmit code and it does not consume the key event.
+The T320 physical PTT button controls Mumla transmission and plays the bundled local start/end
+cue sounds. Recognized key events are consumed so Mumla owns the hardware PTT path.
 
-The start cue is played while TX is off. A future TX integration may only open the TX gate after
-the `BEFORE_TX` cue completes. On release, the TX gate must be closed before the `END_TX` cue is
-played. This ordering keeps both sounds out of the Mumble microphone stream.
+The start cue is played while TX is off, and TX starts only after the `BEFORE_TX` cue completes.
+On release, TX is stopped first; the `END_TX` cue starts after a 100 ms capture-settle delay. This
+ordering keeps both sounds out of the Mumble microphone stream.
 
 ## Enable the listener
 
@@ -27,9 +27,11 @@ produce one local `BEFORE_TX` cue and one local `END_TX` cue.
 Expected fields include:
 
 ```text
-event=PTT_DOWN keyCode=229 scanCode=88 action=ACTION_DOWN repeatCount=0 ... consumed=false
+event=PTT_DOWN keyCode=229 scanCode=88 action=ACTION_DOWN repeatCount=0 ... consumed=true
 cue=BEFORE_TX state=STARTED localOnly=true tx=OFF
-event=PTT_UP keyCode=229 scanCode=88 action=ACTION_UP repeatCount=0 ... consumed=false
+txCommand=DOWN handled=true talking=true
+event=PTT_UP keyCode=229 scanCode=88 action=ACTION_UP repeatCount=0 ... consumed=true
+txCommand=UP handled=true talking=false
 cue=END_TX state=STARTED localOnly=true tx=OFF
 ```
 
