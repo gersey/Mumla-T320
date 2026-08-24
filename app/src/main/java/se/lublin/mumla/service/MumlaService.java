@@ -21,11 +21,13 @@ import android.content.BroadcastReceiver;
 import android.content.Intent;
 import android.content.IntentFilter;
 import android.content.SharedPreferences;
+import android.graphics.Color;
 import android.media.AudioManager;
 import android.media.MediaPlayer;
 import android.media.ToneGenerator;
 import android.net.Uri;
 import android.os.Binder;
+import android.os.BatteryManager;
 import android.os.Build;
 import android.os.Bundle;
 import android.os.Handler;
@@ -109,6 +111,8 @@ public class MumlaService extends HumlaService implements
     private MediaPlayer mT320CuePlayer;
     private ToneGenerator mT320BusyTone;
     private int mT320BusyBeepsPlayed;
+    /** True while Android reports USB/AC/wireless power, so charging keeps LED ownership. */
+    private boolean mT320ExternalPowerConnected = true;
     private final Runnable mStartT320TxAfterCue = this::startT320TxAfterCue;
     private final Runnable mT320FloorRequestTimeout = () -> {
         if (!mT320FloorRequestPending) {
@@ -179,6 +183,21 @@ public class MumlaService extends HumlaService implements
 
     private BroadcastReceiver mTalkReceiver;
 
+    private final BroadcastReceiver mT320BatteryReceiver = new BroadcastReceiver() {
+        @Override
+        public void onReceive(android.content.Context context, Intent intent) {
+            if (!Intent.ACTION_BATTERY_CHANGED.equals(intent.getAction())) {
+                return;
+            }
+            boolean externalPowerConnected = intent.getIntExtra(
+                    BatteryManager.EXTRA_PLUGGED, 0) != 0;
+            if (mT320ExternalPowerConnected != externalPowerConnected) {
+                mT320ExternalPowerConnected = externalPowerConnected;
+                updateT320ActivityLed();
+            }
+        }
+    };
+
     private HumlaObserver mObserver = new HumlaObserver() {
         @Override
         public void onConnecting() {
@@ -205,6 +224,7 @@ public class MumlaService extends HumlaService implements
                 mNotification.setActionsShown(true);
                 mNotification.show();
             }
+            updateT320ActivityLed();
         }
 
         @Override
@@ -352,6 +372,7 @@ public class MumlaService extends HumlaService implements
                 AudioManager audioManager = (AudioManager) getSystemService(AUDIO_SERVICE);
                 audioManager.playSoundEffect(AudioManager.FX_KEYPRESS_STANDARD, -1);
             }
+            updateT320ActivityLed();
         }
     };
 
@@ -384,6 +405,7 @@ public class MumlaService extends HumlaService implements
             mTTS = new TextToSpeech(this, mTTSInitListener);
 
         mTalkReceiver = new TalkBroadcastReceiver(this);
+        registerReceiver(mT320BatteryReceiver, new IntentFilter(Intent.ACTION_BATTERY_CHANGED));
     }
 
     @Override
@@ -407,6 +429,11 @@ public class MumlaService extends HumlaService implements
         preferences.unregisterOnSharedPreferenceChangeListener(this);
         try {
             unregisterReceiver(mTalkReceiver);
+        } catch (IllegalArgumentException e) {
+            e.printStackTrace();
+        }
+        try {
+            unregisterReceiver(mT320BatteryReceiver);
         } catch (IllegalArgumentException e) {
             e.printStackTrace();
         }
@@ -762,6 +789,7 @@ public class MumlaService extends HumlaService implements
         }
         mT320TxActive = false;
         mT320PttActive = false;
+        updateT320ActivityLed();
 
         if (shouldPlayEndCue) {
             mT320Handler.postDelayed(mPlayT320EndCue, T320_END_CUE_TX_SETTLE_DELAY_MS);
@@ -796,6 +824,7 @@ public class MumlaService extends HumlaService implements
             mT320TxActive = true;
             setTalkingState(true);
         }
+        updateT320ActivityLed();
         Log.e(T320PttAccessibilityService.LOG_TAG, "txCommand=DOWN handled=true talking="
                 + isTalking());
     }
@@ -896,6 +925,7 @@ public class MumlaService extends HumlaService implements
             }
             mT320TxActive = false;
             mT320PttActive = false;
+            updateT320ActivityLed();
             mT320BusyBlocked = true;
             playT320BusySignal();
             Log.e(T320PttAccessibilityService.LOG_TAG,
@@ -977,6 +1007,39 @@ public class MumlaService extends HumlaService implements
                     "channel=BUSY_CHECK_FAILED tx=OFF", error);
             return 0;
         }
+    }
+
+    /**
+     * Green indicates reception and red indicates transmission on the T320. Charging always
+     * wins: Mumla withdraws its light request whenever external power is connected.
+     */
+    private void updateT320ActivityLed() {
+        if (mNotification == null) {
+            return;
+        }
+
+        int color = 0;
+        if (!mT320ExternalPowerConnected && isConnectionEstablished()) {
+            boolean transmitting = mT320TxActive;
+            try {
+                IUser self = getSessionUser();
+                transmitting = transmitting || (self != null
+                        && self.getTalkState() != TalkState.PASSIVE);
+            } catch (IllegalStateException ignored) {
+                // Connection state changed while the LED state was being refreshed.
+            }
+
+            if (transmitting) {
+                color = Color.RED;
+            } else if (countAudibleRemoteTalkers() > 0) {
+                color = Color.GREEN;
+            }
+        }
+        mNotification.setActivityLedColor(color);
+        Log.e(T320PttAccessibilityService.LOG_TAG,
+                "activityLed=" + (color == Color.RED ? "RED"
+                        : color == Color.GREEN ? "GREEN" : "OFF")
+                        + " externalPower=" + mT320ExternalPowerConnected);
     }
 
     private int countTalkingUsers(IChannel channel, int selfSession) {
