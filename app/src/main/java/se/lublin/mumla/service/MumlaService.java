@@ -77,6 +77,7 @@ public class MumlaService extends HumlaService implements
     public static final int RECONNECT_DELAY = 10000;
     private static final long T320_START_CUE_TX_SETTLE_DELAY_MS = 200L;
     private static final long T320_END_CUE_TX_SETTLE_DELAY_MS = 100L;
+    private static final long T320_END_CUE_MIN_PRESS_DURATION_MS = 2000L;
     private static final int T320_BUSY_BEEP_COUNT = 3;
     private static final int T320_BUSY_BEEP_DURATION_MS = 120;
     private static final long T320_BUSY_BEEP_INTERVAL_MS = 220L;
@@ -101,6 +102,7 @@ public class MumlaService extends HumlaService implements
     private boolean mT320TxActive;
     private boolean mT320BusyBlocked;
     private boolean mT320FloorRequestPending;
+    private long mT320PttDownElapsedRealtime;
     private String mT320FloorToken;
     private int mT320FloorGatewaySession = -1;
     private Handler mT320Handler;
@@ -714,6 +716,7 @@ public class MumlaService extends HumlaService implements
         stopT320Cue("NEW_PTT_DOWN");
         stopT320BusySignal("NEW_PTT_DOWN");
         mT320PttPressed = true;
+        mT320PttDownElapsedRealtime = SystemClock.elapsedRealtime();
         mT320BusyBlocked = false;
 
         if (!isT320PttEligible()) {
@@ -739,11 +742,16 @@ public class MumlaService extends HumlaService implements
     public void onT320PttUp() {
         boolean hadPress = mT320PttPressed;
         boolean wasBusyBlocked = mT320BusyBlocked;
+        long pressDurationMs = hadPress && mT320PttDownElapsedRealtime > 0
+                ? SystemClock.elapsedRealtime() - mT320PttDownElapsedRealtime
+                : 0L;
         boolean shouldPlayEndCue = hadPress && !wasBusyBlocked
-                && (mT320StartPending || mT320TxActive);
+                && (mT320StartPending || mT320TxActive)
+                && pressDurationMs > T320_END_CUE_MIN_PRESS_DURATION_MS;
 
         releaseT320Floor();
         mT320PttPressed = false;
+        mT320PttDownElapsedRealtime = 0L;
         mT320StartPending = false;
         mT320BusyBlocked = false;
         mT320Handler.removeCallbacks(mStartT320TxAfterCue);
@@ -760,7 +768,9 @@ public class MumlaService extends HumlaService implements
         }
         Log.e(T320PttAccessibilityService.LOG_TAG, "txCommand=UP handled=" + hadPress
                 + " busyBlocked=" + wasBusyBlocked + " talking="
-                + (isT320PttEligible() && isTalking()));
+                + (isT320PttEligible() && isTalking())
+                + " pressDurationMs=" + pressDurationMs
+                + " endCue=" + (shouldPlayEndCue ? "PLAY" : "SKIP"));
     }
 
     private void startT320TxAfterCue() {
@@ -1099,6 +1109,7 @@ public class MumlaService extends HumlaService implements
             setTalkingState(false);
         }
         mT320PttPressed = false;
+        mT320PttDownElapsedRealtime = 0L;
         mT320StartPending = false;
         mT320TxActive = false;
         mT320BusyBlocked = false;
