@@ -53,7 +53,6 @@ public class MumlaConnectionNotification {
     private OnActionListener mListener;
     private String mCustomContentText;
     private boolean mActionsShown;
-    private int mActivityLedColor;
 
     private BroadcastReceiver mNotificationReceiver = new BroadcastReceiver() {
         @Override
@@ -93,18 +92,6 @@ public class MumlaConnectionNotification {
 
     public void setActionsShown(boolean actionsShown) {
         mActionsShown = actionsShown;
-    }
-
-    /**
-     * Uses the T320 notification LED while the device is not charging.
-     * A zero color removes Mumla's light request and leaves the LED to Android.
-     */
-    public void setActivityLedColor(int color) {
-        if (mActivityLedColor == color) {
-            return;
-        }
-        mActivityLedColor = color;
-        createNotification();
     }
 
     /**
@@ -168,10 +155,6 @@ public class MumlaConnectionNotification {
         builder.setCategory(NotificationCompat.CATEGORY_CALL);
         builder.setShowWhen(false);
         builder.setOngoing(true);
-        if (mActivityLedColor != 0) {
-            // offMs=0 requests a steady light for the lifetime of the notification state.
-            builder.setLights(mActivityLedColor, 1, 0);
-        }
 
         if (mActionsShown) {
             // Add notification triggers
